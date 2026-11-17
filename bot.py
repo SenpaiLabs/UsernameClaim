@@ -1,18 +1,22 @@
 """Telegram username claim bot.
 
 Monitors a list of usernames and, as soon as one becomes free, assigns it to
-your channel and notifies you.
+a channel and notifies you.
 
 Note: setting a channel username requires MTProto, so this runs as your own
-Telegram account (Telethon), which must be the owner of CHANNEL.
+Telegram account (Telethon).
 
-Owner commands (send in Saved Messages, in the private chat with OWNER_ID, or,
-if BOT_TOKEN is set, in a private chat with your Telegram bot):
+Channel modes:
+    CHANNEL set    -> the bot uses that channel (your account must own it)
+    CHANNEL empty  -> the bot creates a channel itself. After a successful claim
+                      the channel keeps its username and a fresh channel is
+                      created for the next one when you send /resume.
+
+Owner commands (send in Saved Messages, or in the private chat with OWNER_ID):
     /add <username>      add a username to the watch list
     /remove <username>   remove a username
     /list                show watch list and status
-    /pause               pause monitoring
-    /resume              resume monitoring
+    /resume              resume monitoring after a successful claim
 """
 
 import asyncio
@@ -25,6 +29,7 @@ from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import (
     ChannelsAdminPublicTooMuchError,
+    ChannelsTooMuchError,
     ChatAdminRequiredError,
     FloodWaitError,
     RPCError,
@@ -32,7 +37,12 @@ from telethon.errors import (
     UsernameNotModifiedError,
     UsernameOccupiedError,
 )
-from telethon.tl.functions.channels import CheckUsernameRequest, UpdateUsernameRequest
+from telethon.tl.functions.channels import (
+    CheckUsernameRequest,
+    CreateChannelRequest,
+    UpdateUsernameRequest,
+)
+from telethon.tl.types import PeerChannel
 
 load_dotenv()
 
@@ -45,16 +55,15 @@ def parse_entity(value: str):
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
-CHANNEL = parse_entity(os.environ["CHANNEL"])  # @username, invite link or numeric ID
+_channel_raw = os.getenv("CHANNEL", "").strip()
+AUTO_CREATE = not _channel_raw  # no channel given -> the bot creates one
+CHANNEL = parse_entity(_channel_raw) if _channel_raw else None
+CHANNEL_TITLE = os.getenv("CHANNEL_TITLE", "My Channel")
+CHANNEL_FILE = Path(os.getenv("CHANNEL_FILE", "channel_id.txt"))  # auto-created channel
 OWNER = parse_entity(os.getenv("OWNER_ID", "me"))  # gets notifications, sends commands
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()  # optional: control via a Telegram bot
 CHECK_INTERVAL = float(os.getenv("CHECK_INTERVAL", "30"))  # seconds per full round
 USERNAMES_FILE = Path(os.getenv("USERNAMES_FILE", "usernames.txt"))
 SESSION = os.getenv("SESSION_NAME", "usernameclaim")
-BOT_SESSION = os.getenv("BOT_SESSION_NAME", "usernameclaim_bot")
-
-if BOT_TOKEN and not isinstance(OWNER, int):
-    raise SystemExit("BOT_TOKEN requires OWNER_ID to be your numeric Telegram user ID.")
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO
@@ -62,8 +71,8 @@ logging.basicConfig(
 log = logging.getLogger("usernameclaim")
 
 client = TelegramClient(SESSION, API_ID, API_HASH)
-bot_client = None  # set in main() when BOT_TOKEN is configured
 paused = False
+channel = None  # input entity of the channel currently used for claiming
 notified: set[str] = set()  # alert keys already sent, to avoid repeating every round
 
 
@@ -88,16 +97,10 @@ def save_usernames(names: list[str]) -> None:
 
 
 async def notify(text: str) -> None:
-    """Send via the bot if configured, falling back to the user account."""
-    for sender in (bot_client, client):
-        if sender is None:
-            continue
-        try:
-            await sender.send_message(OWNER, text)
-            return
-        except Exception:
-            log.warning("Notification failed via %s", "bot" if sender is bot_client else "account")
-    log.error("Failed to send notification")
+    try:
+        await client.send_message(OWNER, text)
+    except Exception:
+        log.exception("Failed to send notification")
 
 
 async def notify_once(key: str, text: str) -> None:
@@ -108,15 +111,53 @@ async def notify_once(key: str, text: str) -> None:
     await notify(text)
 
 
-async def try_claim(username: str, channel) -> bool:
+async def ensure_channel():
+    """Return the channel to claim usernames for, creating one if needed."""
+    if not AUTO_CREATE:
+        return await client.get_input_entity(CHANNEL)
+
+    if CHANNEL_FILE.exists():
+        try:
+            saved_id = int(CHANNEL_FILE.read_text().strip())
+            return await client.get_input_entity(PeerChannel(saved_id))
+        except Exception:
+            log.warning("Saved channel not found, creating a new one")
+
+    try:
+        result = await client(
+            CreateChannelRequest(title=CHANNEL_TITLE, about="", broadcast=True)
+        )
+    except ChannelsTooMuchError:
+        await notify_once(
+            "channels-too-much",
+            "Telegram says your account has too many channels/groups. "
+            "Delete or leave some and send /resume.",
+        )
+        raise
+    created = result.chats[0]
+    CHANNEL_FILE.write_text(str(created.id))
+    log.info("Created channel %s (id %s)", CHANNEL_TITLE, created.id)
+    await notify(f"Created channel '{CHANNEL_TITLE}'. Waiting for a free username.")
+    return await client.get_input_entity(created)
+
+
+def forget_channel() -> None:
+    """After a claim in auto mode, the next claim needs a brand new channel."""
+    global channel
+    if AUTO_CREATE:
+        channel = None
+        CHANNEL_FILE.unlink(missing_ok=True)
+
+
+async def try_claim(username: str, target) -> bool:
     """Return True if the username was claimed for the channel."""
     try:
-        available = await client(CheckUsernameRequest(channel, username))
+        available = await client(CheckUsernameRequest(target, username))
         if not available:
             log.info("@%s is taken", username)
             return False
 
-        await client(UpdateUsernameRequest(channel, username))
+        await client(UpdateUsernameRequest(target, username))
     except FloodWaitError as e:
         log.warning("Flood wait: sleeping %s seconds", e.seconds)
         await asyncio.sleep(e.seconds + 1)
@@ -160,35 +201,41 @@ async def try_claim(username: str, channel) -> bool:
         return False
 
     log.info("Claimed @%s", username)
-    await notify(f"Claimed @{username} for your channel.")
+    await notify(f"Claimed @{username}: https://t.me/{username}")
     return True
 
 
 async def monitor() -> None:
-    global paused
+    global paused, channel
     await client.get_dialogs()  # fills the entity cache so numeric IDs resolve
-    channel = await client.get_input_entity(CHANNEL)
-    log.info("Monitoring started")
+    log.info("Monitoring started (%s channel)", "auto-created" if AUTO_CREATE else "given")
     while True:
         try:
             if not paused:
+                if channel is None:
+                    channel = await ensure_channel()
                 for username in load_usernames():  # list order = priority
                     if await try_claim(username, channel):
                         paused = True
                         save_usernames(
                             [n for n in load_usernames() if n != username]
                         )
+                        forget_channel()
                         break
                     await asyncio.sleep(random.uniform(1, 3))
+        except FloodWaitError as e:
+            log.warning("Flood wait: sleeping %s seconds", e.seconds)
+            await asyncio.sleep(e.seconds + 1)
         except Exception:
             log.exception("Monitor round failed, retrying next round")
         await asyncio.sleep(CHECK_INTERVAL + random.uniform(0, CHECK_INTERVAL * 0.2))
 
 
-COMMAND_PATTERN = r"^/(add|remove|list|pause|resume|start|help)\b"
-USAGE = "Usage: /add <username>, /remove <username>, /list, /pause, /resume"
-
-
+@client.on(
+    events.NewMessage(
+        chats=OWNER, from_users=OWNER, pattern=r"^/(add|remove|list|resume)\b"
+    )
+)
 async def commands(event: events.NewMessage.Event) -> None:
     global paused
     command = event.pattern_match.group(1)
@@ -213,38 +260,13 @@ async def commands(event: events.NewMessage.Event) -> None:
         paused = False
         notified.clear()
         await event.reply("Monitoring resumed.")
-    elif command == "pause":
-        paused = True
-        await event.reply("Monitoring paused.")
     else:
-        await event.reply(USAGE)
+        await event.reply("Usage: /add <username>, /remove <username>, /list, /resume")
 
 
 async def main() -> None:
-    global bot_client
     await client.start()  # first run asks for phone number and login code
-    client.add_event_handler(
-        commands,
-        events.NewMessage(chats=OWNER, from_users=OWNER, pattern=COMMAND_PATTERN),
-    )
-    tasks = [monitor(), client.run_until_disconnected()]
-
-    if BOT_TOKEN:
-        bot_client = TelegramClient(BOT_SESSION, API_ID, API_HASH)
-        await bot_client.start(bot_token=BOT_TOKEN)
-        bot_client.add_event_handler(
-            commands,
-            events.NewMessage(
-                incoming=True,
-                from_users=OWNER,
-                pattern=COMMAND_PATTERN,
-                func=lambda e: e.is_private,
-            ),
-        )
-        log.info("Bot control enabled")
-        tasks.append(bot_client.run_until_disconnected())
-
-    await asyncio.gather(*tasks)
+    await asyncio.gather(monitor(), client.run_until_disconnected())
 
 
 if __name__ == "__main__":

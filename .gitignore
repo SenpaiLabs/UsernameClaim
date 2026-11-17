@@ -2,5 +2,6 @@
 *.session
 *.session-journal
 usernames.txt
+channel_id.txt
 __pycache__/
 .venv/
