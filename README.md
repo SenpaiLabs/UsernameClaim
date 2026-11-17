@@ -35,6 +35,7 @@ Edit `.env`:
 | `API_ID`, `API_HASH` | Credentials from my.telegram.org |
 | `CHANNEL` | Your channel: `@username`, invite link or numeric ID |
 | `OWNER_ID` | Who receives alerts and can send commands. `me` means Saved Messages, or use a numeric user ID |
+| `BOT_TOKEN` | Optional. Token from [@BotFather](https://t.me/BotFather) to control the commands from a bot. Requires a numeric `OWNER_ID` |
 | `CHECK_INTERVAL` | Seconds between rounds (default `30`, keep it at 20 or more) |
 
 ## Usage
@@ -52,7 +53,12 @@ Send these commands in Saved Messages (or in the private chat with `OWNER_ID`):
 | `/add username` | Add a username to the watch list |
 | `/remove username` | Remove a username |
 | `/list` | Show the list and whether monitoring is running or paused |
+| `/pause` | Pause monitoring |
 | `/resume` | Resume monitoring after a successful claim |
+
+### Control with a bot token
+
+Set `BOT_TOKEN` (and a numeric `OWNER_ID`), start `bot.py`, then open your bot in Telegram and send `/start`. The same commands work in the bot's private chat, and only `OWNER_ID` is accepted. Alerts are sent through the bot, with your account as fallback. The claiming itself still runs on your account, because the Bot API cannot set channel usernames.
 
 A channel can have only one username, so monitoring pauses after a successful claim. Use `/resume` to continue (a later claim replaces the current username).
 
