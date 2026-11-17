@@ -122,7 +122,15 @@ async def try_claim(username: str, channel) -> bool:
         await asyncio.sleep(e.seconds + 1)
         return False
     except UsernameOccupiedError:
-        log.info("@%s was taken just before claim", username)
+        log.warning(
+            "@%s passed check but set was refused (reserved/Fragment/cooldown?)",
+            username,
+        )
+        await notify_once(
+            f"occupied:{username}",
+            f"@{username} shows free but Telegram refuses to assign it "
+            "(likely reserved, on Fragment, or in release cooldown). Will keep retrying.",
+        )
         return False
     except UsernameInvalidError:
         log.warning("@%s is invalid", username)
